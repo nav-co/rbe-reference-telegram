@@ -33,6 +33,7 @@ env:
   RBE_ENDPOINT: grpcs://build-cache-api-iad.services.bitrise.io
   TELEGRAM_LOCAL_FALLBACK_FLAGS: >-
     --strategy=MetalCompile=local
+    --strategy=MetallibCompile=local
     --strategy_regexp=^Compiling.third-party/openh264/=local
     --strategy_regexp=^Compiling.third-party/webrtc/webrtc/(sdk/|rtc_base/system/(gcd_helpers|cocoa_threading))=local
 
