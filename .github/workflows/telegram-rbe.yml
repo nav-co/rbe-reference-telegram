@@ -1,0 +1,227 @@
+# .github/workflows/telegram-rbe.yml
+#
+# Builds upstream Telegram-iOS (pinned commit) with Bazel Remote Build Execution on Bitrise,
+# mirroring the Bitrise reference workflow ACI_ReferenceApps_RBE_Production_Mac_Telegram.
+#
+# Setup (repo Settings → Secrets and variables → Actions):
+#   secret   BITRISE_BUILD_CACHE_AUTH_TOKEN    Workspace API token / PAT (not needed on Build Hub runners)
+#   variable BITRISE_BUILD_CACHE_WORKSPACE_ID  slug of the Workspace that has RBE + the "darwin" pool
+#   variable RUNNER_LABEL      (optional)      e.g. your Build Hub macOS pool label; defaults to macos-26
+#   variable XCODE_APP         (optional)      e.g. /Applications/Xcode_26.2.app to pin Xcode
+
+name: Telegram iOS – Bazel RBE
+
+on:
+  workflow_dispatch:
+    inputs:
+      rbe_jobs:
+        description: Bazel --jobs
+        default: "200"
+      rbe_pool:
+        description: RBE worker pool name
+        default: darwin
+  push:
+    branches: [main]
+
+concurrency:
+  group: telegram-rbe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TELEGRAM_REPO: TelegramMessenger/Telegram-iOS
+  TELEGRAM_COMMIT: 6ad963e5b62d354da79040f388ae2b9132fb17b8
+  RBE_JOBS: ${{ inputs.rbe_jobs || '200' }}
+  RBE_POOL: ${{ inputs.rbe_pool || 'darwin' }}
+  RBE_ENDPOINT: grpcs://build-cache-api-iad.services.bitrise.io
+  TELEGRAM_LOCAL_FALLBACK_FLAGS: >-
+    --strategy=MetalCompile=local
+    --strategy_regexp=^Compiling.third-party/openh264/=local
+    --strategy_regexp=^Compiling.third-party/webrtc/webrtc/(sdk/|rtc_base/system/(gcd_helpers|cocoa_threading))=local
+
+jobs:
+  build:
+    runs-on: ${{ vars.RUNNER_LABEL || 'bitrise_pool_name:Bitrise-M4Pro' }}
+    timeout-minutes: 120
+    env:
+      BITRISE_BUILD_CACHE_AUTH_TOKEN: ${{ secrets.BITRISE_BUILD_CACHE_AUTH_TOKEN }}
+      BITRISE_BUILD_CACHE_WORKSPACE_ID: ${{ vars.BITRISE_BUILD_CACHE_WORKSPACE_ID }}
+    steps:
+      - name: Checkout Telegram-iOS at pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TELEGRAM_REPO }}
+          ref: ${{ env.TELEGRAM_COMMIT }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode
+        run: |
+          set -euxo pipefail
+          if [[ -n "${{ vars.XCODE_APP }}" ]]; then
+            sudo xcode-select -s "${{ vars.XCODE_APP }}"
+          fi
+          xcodebuild -version
+
+      - name: Install the Bitrise Build Cache CLI
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl --retry 5 -sSfL 'https://raw.githubusercontent.com/bitrise-io/bitrise-build-cache-cli/main/install/installer.sh' | sh -s -- -b "$HOME/.local/bin" -d
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Own step: the CLI publishes its config via $GITHUB_ENV, which only applies to later steps.
+      # Cache push is off for RBE: the remote workers upload results to the cache themselves.
+      - name: Activate Bitrise Build Cache + RBE for Bazel
+        run: bitrise-build-cache activate bazel --cache --cache-push=false --rbe
+
+      - name: Show generated ~/.bazelrc
+        run: cat ~/.bazelrc
+
+      - name: Import fake codesigning certificates
+        run: |
+          set -euxo pipefail
+          # Upstream ships fake certs/profiles for CI-style builds; nothing real has to be uploaded.
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+
+      - name: Ensure Metal toolchain
+        run: |
+          set -euxo pipefail
+          # Xcode 26 ships the Metal toolchain as a separate component. MetalCompile runs locally
+          # (see TELEGRAM_LOCAL_FALLBACK_FLAGS), so fetch it only when it's missing.
+          if ! xcrun metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun metal --version
+          fi
+
+      - name: Build Telegram with Bazel RBE
+        run: |
+          set -euxo pipefail
+          DEPLOY_DIR="$RUNNER_TEMP/deploy"
+          mkdir -p "$DEPLOY_DIR"
+
+          # Make.py accepts --bazelArguments but never forwards it, so every override goes
+          # through the repo .bazelrc. Lines are appended after upstream's, so they win.
+          # Both plain and :macos variants are set because upstream scopes SwiftCompile to build:macos.
+          BUILD_RANDOM=$(uuidgen)
+          {
+            echo ""
+            echo "# --- Bitrise RBE reference app overrides ---"
+            echo "common --show_timestamps"
+            echo "common --color=yes"
+            echo "build --jobs=${RBE_JOBS}"
+            echo "build --spawn_strategy=remote,local"
+            echo "build --strategy=Genrule=remote,local"
+            echo "build --strategy=SwiftCompile=remote,local"
+            echo "build:macos --strategy=SwiftCompile=remote,local"
+            echo "build --remote_default_exec_properties=Pool=${RBE_POOL}"
+            echo "build --remote_cache_compression"
+            echo "build --build_event_json_file=${GITHUB_WORKSPACE}/bep.json"
+            echo "build --execution_log_compact_file=${DEPLOY_DIR}/exec.log.bin"
+            echo "build --repo_env=BUILD_RANDOM=${BUILD_RANDOM}"
+            echo "build --action_env=BUILD_RANDOM=${BUILD_RANDOM}"
+            echo "build --define=BUILD_RANDOM=${BUILD_RANDOM}"
+            for f in ${TELEGRAM_LOCAL_FALLBACK_FLAGS}; do
+              echo "build $f"
+            done
+          } >> .bazelrc
+          tail -n 25 .bazelrc
+
+          # Make.py runs bazel with PATH=/usr/bin:/bin:/usr/sbin:/sbin, so the bare credential
+          # helper name written by the build cache CLI can't be resolved. Point it at the full path.
+          HELPER="$(command -v bitrise-build-cache)"
+          sed -i '' "s#=bitrise-build-cache\$#=${HELPER}#" ~/.bazelrc
+          grep -n credential_helper ~/.bazelrc || echo "no credential_helper line (token auth via headers)"
+
+          # Pin executor/cache/downloader to IAD so actions land on the IAD "darwin" pool.
+          # ~/.bazelrc is read after the repo .bazelrc, so this has to go there.
+          {
+            echo "build --remote_executor=${RBE_ENDPOINT}"
+            echo "build --remote_cache=${RBE_ENDPOINT}"
+            echo "build --experimental_remote_downloader=${RBE_ENDPOINT}"
+          } >> ~/.bazelrc
+
+          # Make.py passes --@build_bazel_rules_swift//swift:copt="-j" / ="N" as argv with the quotes
+          # kept. The local persistent worker tolerates that, but a remote SwiftCompile hands `"-j"` to
+          # swiftc as an input file. Hand Make.py a bazel wrapper that drops the stray quotes; it runs
+          # the bazel release pinned (version + sha256) in versions.json.
+          IFS=: read -r BAZEL_VERSION BAZEL_SHA256 < <(python3 -c 'import json;print(json.load(open("versions.json"))["bazel"])')
+          WRAPPER="$HOME/telegram-bazel-wrapper/bazel"
+          REAL_BAZEL="$HOME/telegram-bazel-wrapper/bazel-${BAZEL_VERSION}-darwin-arm64"
+          mkdir -p "$(dirname "$WRAPPER")"
+          curl -fsSL --retry 5 -o "$REAL_BAZEL" "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64"
+          echo "${BAZEL_SHA256}  ${REAL_BAZEL}" | shasum -a 256 -c -
+          chmod +x "$REAL_BAZEL"
+          cat > "$WRAPPER" <<WRAP
+          #!/bin/bash
+          args=()
+          for a in "\$@"; do
+            case "\$a" in
+              --@build_bazel_rules_swift//swift:copt=\"*\") v="\${a#*=\"}"; args+=("--@build_bazel_rules_swift//swift:copt=\${v%\"}") ;;
+              *) args+=("\$a") ;;
+            esac
+          done
+          exec ${REAL_BAZEL} "\${args[@]}"
+          WRAP
+          chmod +x "$WRAPPER"
+          cat "$WRAPPER"
+
+          # Upstream pins Xcode 26.2 in versions.json; take the installed one instead.
+          python3 build-system/Make/Make.py \
+              --bazel="$WRAPPER" \
+              --overrideXcodeVersion \
+              build \
+              --configurationPath=build-system/appstore-configuration.json \
+              --codesigningInformationPath=build-system/fake-codesigning \
+              --configuration=release_sim_arm64 \
+              --buildNumber=100001 \
+              --enableParallelSwiftmoduleGeneration
+
+      - name: Capture failed-action BEP events
+        if: always()
+        run: |
+          set -uo pipefail
+          # RBE failures reach the invocation page without stderr; keep the failed-action events.
+          DEPLOY_DIR="$RUNNER_TEMP/deploy"
+          mkdir -p "$DEPLOY_DIR"
+          BEP="${GITHUB_WORKSPACE}/bep.json"
+          [[ -f "$BEP" ]] || { echo "no BEP at $BEP"; exit 0; }
+
+          python3 - "$BEP" "${DEPLOY_DIR}/failed-actions-bep.json" <<'PY' || echo "extract failed; raw stream still shipped"
+          import json, sys
+
+          src, dst = sys.argv[1], sys.argv[2]
+          kept = 0
+          with open(dst, "w") as out:
+              for line in open(src):
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      e = json.loads(line)
+                  except Exception:
+                      continue
+                  a = e.get("action")
+                  if not a or a.get("success"):
+                      continue
+                  kept += 1
+                  out.write(json.dumps({
+                      "id": e.get("id"),
+                      "type": a.get("type"),
+                      "exitCode": a.get("exitCode"),
+                      "stderr": a.get("stderr"),
+                      "stdout": a.get("stdout"),
+                      "failureDetail": a.get("failureDetail"),
+                  }) + "\n")
+          print("failed-action events kept:", kept)
+          PY
+
+          gzip -9 -c "$BEP" > "${DEPLOY_DIR}/bep.json.gz"
+          ls -la "${DEPLOY_DIR}"
+
+      - name: Upload BEP + execution log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-rbe-logs
+          path: ${{ runner.temp }}/deploy
+          if-no-files-found: ignore
