@@ -20,6 +20,15 @@ on:
       rbe_pool:
         description: RBE worker pool name
         default: darwin
+      cold_build:
+        description: Bust the cache with a random BUILD_RANDOM (uncheck to measure a warm-cache build)
+        type: boolean
+        default: true
+      swift_jobs:
+        description: swiftc -j per Swift action (empty = Make.py default, runner cores - 2)
+        default: ""
+  #push:
+    #branches: [main]
 
 concurrency:
   group: telegram-rbe-${{ github.ref }}
@@ -30,6 +39,8 @@ env:
   TELEGRAM_COMMIT: 6ad963e5b62d354da79040f388ae2b9132fb17b8
   RBE_JOBS: ${{ inputs.rbe_jobs || '200' }}
   RBE_POOL: ${{ inputs.rbe_pool || 'darwin' }}
+  SWIFT_JOBS: ${{ inputs.swift_jobs || vars.SWIFT_JOBS || '' }}
+  COLD_BUILD: ${{ github.event_name != 'workflow_dispatch' || inputs.cold_build }}
   RBE_ENDPOINT: grpcs://build-cache-api-iad.services.bitrise.io
   TELEGRAM_LOCAL_FALLBACK_FLAGS: >-
     --strategy=MetalCompile=local
@@ -39,7 +50,7 @@ env:
 
 jobs:
   build:
-    runs-on: ${{ vars.RUNNER_LABEL || 'bitrise_pool_name:Bitrise-M4' }}
+    runs-on: ${{ vars.RUNNER_LABEL || 'macos-26' }}
     timeout-minutes: 120
     env:
       BITRISE_BUILD_CACHE_AUTH_TOKEN: ${{ secrets.BITRISE_BUILD_CACHE_AUTH_TOKEN }}
@@ -116,9 +127,12 @@ jobs:
             echo "build --remote_cache_compression"
             echo "build --build_event_json_file=${GITHUB_WORKSPACE}/bep.json"
             echo "build --execution_log_compact_file=${DEPLOY_DIR}/exec.log.bin"
-            echo "build --repo_env=BUILD_RANDOM=${BUILD_RANDOM}"
-            echo "build --action_env=BUILD_RANDOM=${BUILD_RANDOM}"
-            echo "build --define=BUILD_RANDOM=${BUILD_RANDOM}"
+            # Cold benchmark: a fresh BUILD_RANDOM changes every action key, so nothing hits the cache.
+            if [[ "${COLD_BUILD}" == "true" ]]; then
+              echo "build --repo_env=BUILD_RANDOM=${BUILD_RANDOM}"
+              echo "build --action_env=BUILD_RANDOM=${BUILD_RANDOM}"
+              echo "build --define=BUILD_RANDOM=${BUILD_RANDOM}"
+            fi
             for f in ${TELEGRAM_LOCAL_FALLBACK_FLAGS}; do
               echo "build $f"
             done
@@ -143,6 +157,8 @@ jobs:
           # kept. The local persistent worker tolerates that, but a remote SwiftCompile hands `"-j"` to
           # swiftc as an input file. Hand Make.py a bazel wrapper that drops the stray quotes; it runs
           # the bazel release pinned (version + sha256) in versions.json.
+          # Make.py also sizes that -j from the RUNNER's cores (cpu_count - 2), not the RBE worker's;
+          # if SWIFT_JOBS is set, the wrapper replaces the value after "-j" with it.
           IFS=: read -r BAZEL_VERSION BAZEL_SHA256 < <(python3 -c 'import json;print(json.load(open("versions.json"))["bazel"])')
           WRAPPER="$HOME/telegram-bazel-wrapper/bazel"
           REAL_BAZEL="$HOME/telegram-bazel-wrapper/bazel-${BAZEL_VERSION}-darwin-arm64"
@@ -152,13 +168,20 @@ jobs:
           chmod +x "$REAL_BAZEL"
           cat > "$WRAPPER" <<WRAP
           #!/bin/bash
+          SWIFT_JOBS="${SWIFT_JOBS}"
           args=()
+          prev=""
           for a in "\$@"; do
             case "\$a" in
-              --@build_bazel_rules_swift//swift:copt=\"*\") v="\${a#*=\"}"; args+=("--@build_bazel_rules_swift//swift:copt=\${v%\"}") ;;
-              *) args+=("\$a") ;;
+              --@build_bazel_rules_swift//swift:copt=\"*\")
+                v="\${a#*=\"}"; v="\${v%\"}"
+                if [ "\$prev" = "-j" ] && [ -n "\$SWIFT_JOBS" ]; then v="\$SWIFT_JOBS"; fi
+                prev="\$v"
+                args+=("--@build_bazel_rules_swift//swift:copt=\$v") ;;
+              *) prev=""; args+=("\$a") ;;
             esac
           done
+          echo "bazel-wrapper: \${args[*]}" >&2
           exec ${REAL_BAZEL} "\${args[@]}"
           WRAP
           chmod +x "$WRAPPER"
