@@ -27,8 +27,6 @@ on:
       swift_jobs:
         description: swiftc -j per Swift action (empty = Make.py default, runner cores - 2)
         default: ""
-  #push:
-    #branches: [main]
 
 concurrency:
   group: telegram-rbe-${{ github.ref }}
@@ -181,7 +179,9 @@ jobs:
               *) prev=""; args+=("\$a") ;;
             esac
           done
-          echo "bazel-wrapper: \${args[*]}" >&2
+          # Only log for "build": Make.py runs "bazel --version" with stderr merged into stdout and
+          # requires the output to start with "bazel ".
+          if [ "\${1:-}" = "build" ]; then echo "bazel-wrapper: \${args[*]}" >&2; fi
           exec ${REAL_BAZEL} "\${args[@]}"
           WRAP
           chmod +x "$WRAPPER"
